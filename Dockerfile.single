@@ -100,4 +100,6 @@ RUN mkdir -p /var/log/supervisor
 #
 # Example: docker run -e API_URL=https://your-domain.com/api ...
 
-CMD ["/usr/bin/supervisord", "-c", "/etc/supervisor/conf.d/supervisord.conf"]
+# Increase file descriptor limit for moviepy/ffmpeg audio concatenation
+# Default is typically 1024, which is insufficient for combining 80+ audio clips
+CMD ["bash", "-c", "ulimit -n 65536 && /usr/bin/supervisord -c /etc/supervisor/conf.d/supervisord.conf"]
