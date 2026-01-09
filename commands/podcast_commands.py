@@ -141,9 +141,16 @@ async def combine_audio_files_ffmpeg(
                 pass
 
 
-# Apply the monkey-patch
+# Apply the monkey-patch to both core and nodes modules
+# The nodes module may have already imported the function directly
 podcast_core.combine_audio_files = combine_audio_files_ffmpeg
-logger.info("Applied FFMPEG-based audio concatenation patch to podcast_creator")
+try:
+    import podcast_creator.nodes as podcast_nodes
+    podcast_nodes.combine_audio_files = combine_audio_files_ffmpeg
+    logger.info("Applied FFMPEG patch to podcast_creator.core and podcast_creator.nodes")
+except (ImportError, AttributeError) as e:
+    logger.warning(f"Could not patch podcast_creator.nodes: {e}")
+    logger.info("Applied FFMPEG patch to podcast_creator.core only")
 
 
 def full_model_dump(model):
