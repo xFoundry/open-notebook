@@ -1,6 +1,8 @@
+import subprocess
 import time
+import uuid
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Union
 
 from loguru import logger
 from pydantic import BaseModel
@@ -12,9 +14,136 @@ from open_notebook.podcasts.models import EpisodeProfile, PodcastEpisode, Speake
 
 try:
     from podcast_creator import configure, create_podcast
+    import podcast_creator.core as podcast_core
 except ImportError as e:
     logger.error(f"Failed to import podcast_creator: {e}")
     raise ValueError("podcast_creator library not available")
+
+
+# =============================================================================
+# MONKEY-PATCH: Replace moviepy-based audio concatenation with direct FFMPEG
+# This fixes the "[Errno 11] Resource temporarily unavailable" error that occurs
+# when moviepy tries to load 60+ audio clips simultaneously, exhausting file
+# descriptors. Direct FFMPEG concatenation uses minimal resources.
+# =============================================================================
+async def combine_audio_files_ffmpeg(
+    audio_dir: Union[Path, str], final_filename: str, final_output_dir: Union[Path, str]
+):
+    """
+    Combines multiple audio files into a single MP3 file using direct FFMPEG.
+    This replaces the moviepy-based version which exhausts file descriptors.
+    """
+    logger.info("[Patched] combine_audio_files_ffmpeg called - using direct FFMPEG")
+
+    if isinstance(audio_dir, str):
+        audio_dir = Path(audio_dir)
+    if isinstance(final_output_dir, str):
+        final_output_dir = Path(final_output_dir)
+
+    list_of_audio_paths = sorted(audio_dir.glob("*.mp3"))
+
+    if not list_of_audio_paths:
+        logger.warning("combine_audio_files: No audio files found in directory.")
+        return {"combined_audio_path": "ERROR: No audio segment data"}
+
+    logger.info(f"Found {len(list_of_audio_paths)} audio clips to combine")
+
+    # Create output directory
+    final_output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Determine output filename
+    if final_filename and isinstance(final_filename, str):
+        output_filename = Path(final_filename).name
+        if not output_filename.endswith(".mp3"):
+            output_filename += ".mp3"
+    else:
+        output_filename = f"combined_{uuid.uuid4().hex}.mp3"
+        logger.warning(f"'final_filename' not provided. Using: {output_filename}")
+
+    output_path = final_output_dir / output_filename
+
+    # Create a temporary file list for FFMPEG concat demuxer
+    filelist_path = audio_dir / "filelist.txt"
+    try:
+        with open(filelist_path, "w") as f:
+            for audio_path in list_of_audio_paths:
+                # FFMPEG concat requires single quotes for paths with special chars
+                escaped_path = str(audio_path.resolve()).replace("'", "'\\''")
+                f.write(f"file '{escaped_path}'\n")
+
+        logger.info(f"Created FFMPEG file list with {len(list_of_audio_paths)} entries")
+
+        # Use FFMPEG concat demuxer - much more efficient than moviepy
+        # -f concat: use concat demuxer
+        # -safe 0: allow absolute paths
+        # -i filelist.txt: input file list
+        # -c copy: stream copy (no re-encoding, very fast)
+        # For MP3 we need to re-encode to ensure proper concatenation
+        cmd = [
+            "ffmpeg",
+            "-y",  # Overwrite output file
+            "-f", "concat",
+            "-safe", "0",
+            "-i", str(filelist_path),
+            "-c:a", "libmp3lame",  # Re-encode as MP3
+            "-q:a", "2",  # High quality
+            str(output_path)
+        ]
+
+        logger.info(f"Running FFMPEG: {' '.join(cmd)}")
+
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=600  # 10 minute timeout for large files
+        )
+
+        if result.returncode != 0:
+            logger.error(f"FFMPEG failed with code {result.returncode}")
+            logger.error(f"FFMPEG stderr: {result.stderr}")
+            return {"combined_audio_path": f"ERROR: FFMPEG failed - {result.stderr[:500]}"}
+
+        # Get duration using ffprobe
+        duration = 0.0
+        try:
+            probe_cmd = [
+                "ffprobe", "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                str(output_path)
+            ]
+            probe_result = subprocess.run(probe_cmd, capture_output=True, text=True)
+            if probe_result.returncode == 0:
+                duration = float(probe_result.stdout.strip())
+        except Exception as e:
+            logger.warning(f"Could not get duration: {e}")
+
+        logger.info(f"Successfully combined audio to: {output_path.resolve()}")
+        return {
+            "combined_audio_path": str(output_path.resolve()),
+            "original_segments_count": len(list_of_audio_paths),
+            "total_duration_seconds": duration,
+        }
+
+    except subprocess.TimeoutExpired:
+        logger.error("FFMPEG timed out after 10 minutes")
+        return {"combined_audio_path": "ERROR: FFMPEG timeout"}
+    except Exception as e:
+        logger.error(f"Error combining audio files: {e}")
+        return {"combined_audio_path": f"ERROR: {e}"}
+    finally:
+        # Clean up filelist
+        if filelist_path.exists():
+            try:
+                filelist_path.unlink()
+            except Exception:
+                pass
+
+
+# Apply the monkey-patch
+podcast_core.combine_audio_files = combine_audio_files_ffmpeg
+logger.info("Applied FFMPEG-based audio concatenation patch to podcast_creator")
 
 
 def full_model_dump(model):
